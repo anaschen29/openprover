@@ -16,7 +16,7 @@ from .prover import Prover, slugify
 from .research import ResearchProver
 from .tui import TUI, HeadlessTUI
 
-SUBCOMMANDS = {"inspect", "fetch-lean-data"}
+SUBCOMMANDS = {"inspect", "fetch-lean-data", "feedback"}
 
 RUN_CONFIG_FILE = "run_config.toml"
 
@@ -91,6 +91,9 @@ def _load_run_config(work_dir: Path) -> dict | None:
 def main():
     if len(sys.argv) >= 2 and sys.argv[1] in SUBCOMMANDS:
         cmd = sys.argv[1]
+        if cmd == "feedback":
+            from .feedback import main as feedback_main
+            return feedback_main(sys.argv[2:])
         if cmd == "inspect":
             return _cmd_inspect()
         if cmd == "fetch-lean-data":
