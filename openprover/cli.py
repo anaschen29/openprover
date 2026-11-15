@@ -10,9 +10,10 @@ from datetime import datetime
 from pathlib import Path
 
 from openprover import __version__
-from .budget import Budget, parse_duration
+from .budget import Budget, ResearchBudget, parse_duration
 from .llm import LLMClient, GLMClient, HFClient, MistralClient, OpenRouterClient, OpenAIClient
 from .prover import Prover, slugify
+from .research import ResearchProver
 from .tui import TUI, HeadlessTUI
 
 SUBCOMMANDS = {"inspect", "fetch-lean-data"}
@@ -22,7 +23,8 @@ RUN_CONFIG_FILE = "run_config.toml"
 
 def _cli_flag_given(*flags: str) -> bool:
     """Check if any of the given CLI flags were explicitly passed by the user."""
-    return any(f in sys.argv for f in flags)
+    return any(arg == flag or arg.startswith(flag + "=")
+               for arg in sys.argv[1:] for flag in flags)
 
 
 def _save_run_config(work_dir: Path, *, planner_model: str, worker_model: str,
@@ -195,8 +197,17 @@ def _resolve_inputs(parser, args):
         else:
             proof_md_text = ""
 
-    # Determine mode from available inputs
-    if lean_theorem_text and proof_md_text:
+    # Research is a persisted run mode, never inferred from proof/report files.
+    saved = _load_run_config(run_dir) if resuming else None
+    saved_mode = (saved or {}).get("mode")
+    requested_mode = getattr(args, "mode", None)
+    if requested_mode == "research" and resuming and saved_mode != "research":
+        parser.error("cannot convert an existing proof run to research mode")
+    if requested_mode == "research" or saved_mode == "research":
+        if args.lean_theorem or args.proof or lean_theorem_text:
+            parser.error("research mode does not accept --lean-theorem or --proof")
+        mode = "research"
+    elif lean_theorem_text and proof_md_text:
         mode = "formalize_only"
     elif lean_theorem_text:
         mode = "prove_and_formalize"
@@ -222,6 +233,9 @@ def _resolve_inputs(parser, args):
 
 def _is_finished(work_dir: Path, mode: str) -> bool:
     """Check if a run is already finished (has discussion or proof)."""
+    if mode == "research":
+        state = ResearchBudget.load_state(work_dir)
+        return bool(state and state["status"] == "finished")
     has_discussion = (work_dir / "DISCUSSION.md").exists()
     has_proof_md = (work_dir / "PROOF.md").exists()
     has_proof_lean = (work_dir / "PROOF.lean").exists()
@@ -240,7 +254,11 @@ def _cmd_prove():
     )
     model_choices = ["sonnet", "opus", "minimax-m2.5", "leanstral", "glm-5", "kimi-k2.5", "minimax-m2.7"]
     parser.add_argument("run_dir", nargs="?", help="Working directory (resumes if it contains an existing run)")
-    parser.add_argument("--theorem", metavar="FILE", help="Path to theorem statement file (.md)")
+    parser.add_argument("--theorem", metavar="FILE", help="Path to theorem or research objective (.md)")
+    parser.add_argument("--mode", choices=["research"], default=None,
+                        help="Open-ended research; omit for existing theorem/Lean modes")
+    parser.add_argument("--continue", dest="continue_research", action="store_true",
+                        help="Grant a finished research run a new explicit time/token budget")
     parser.add_argument("--model", default="gpt-6-astra", help="Model for planner and worker (default: gpt-6-astra)")
     parser.add_argument("--planner-model", default=None, help="Override model for planner (defaults to --model)")
     parser.add_argument("--worker-model", default=None, help="Override model for worker (defaults to --model)")
@@ -253,7 +271,7 @@ def _cmd_prove():
     budget_group.add_argument("--max-tokens", type=int, default=None, metavar="N", help="Output token budget (mutually exclusive with --max-time)")
     budget_group.add_argument("--max-time", type=str, default=None, metavar="DURATION", help="Wall-clock time budget, e.g. '30m', '2h' (default: 4h)")
     parser.add_argument("--conclude-after", type=float, default=0.99, metavar="RATIO", help="Fraction of budget that triggers conclusion (0.9-1.0, default: 0.99)")
-    parser.add_argument("--autonomous", action="store_true", help="Start in autonomous mode (default: interactive)")
+    parser.add_argument("--autonomous", action="store_true", help="Run without human confirmation")
     parser.add_argument("--read-only", action="store_true", help="Inspect run without resuming")
     parser.add_argument("--isolation", action=argparse.BooleanOptionalAction, default=True, help="Disable web searches (no literature_search action)")
     parser.add_argument("-P", "--max-workers", type=int, default=1, help="Max parallel workers per spawn step (default: 1)")
@@ -304,6 +322,31 @@ def _cmd_prove():
 
     (work_dir, theorem_text, lean_theorem_text, proof_md_text,
      mode, resuming, read_only) = _resolve_inputs(parser, args)
+
+    explicit_budget = _cli_flag_given("--max-time", "--max-tokens")
+    if args.continue_research:
+        if mode != "research" or not resuming or read_only:
+            parser.error("--continue requires an existing research run, without --read-only")
+        if not explicit_budget:
+            parser.error("--continue requires a new --max-time or --max-tokens budget")
+    elif mode == "research" and resuming and explicit_budget:
+        parser.error("resuming preserves the budget; use --continue to grant a new allocation")
+    if mode == "research":
+        try:
+            finished = _is_finished(work_dir, mode)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.continue_research and not finished:
+            parser.error("--continue requires a finished allocation; resume the current one without it")
+        if read_only or (finished and not args.continue_research):
+            # Inspection must not instantiate API clients or reset a budget.
+            print(f"Research run: {work_dir}")
+            print("Allocation finished." if finished else "Research state preserved (read-only).")
+            print(f"Final report: {work_dir / 'DISCUSSION.md'}")
+            print("Use openprover inspect RUN_DIR to browse history.")
+            if finished:
+                print("To continue: openprover RUN_DIR --continue --max-time 8h")
+            return
 
     # Map short model names to backend-specific model IDs
     HF_MODEL_MAP: dict[str, str] = {}
@@ -397,7 +440,7 @@ def _cmd_prove():
 
     # Finished runs always enter inspect mode
     finished = resuming and _is_finished(work_dir, mode)
-    inspect_mode = finished or read_only
+    inspect_mode = (finished and not args.continue_research) or read_only
 
     # Resolve --lean-items default
     if args.lean_items is None:
@@ -532,14 +575,23 @@ def _cmd_prove():
     else:
         budget_mode, budget_limit = "time", parse_duration("4h")
 
-    budget = Budget(
-        mode=budget_mode,
-        limit=budget_limit,
-        conclude_after=args.conclude_after,
-    )
+    if mode == "research":
+        try:
+            budget = ResearchBudget(
+                work_dir, budget_mode, budget_limit, args.conclude_after,
+                resume=resuming, renew=args.continue_research,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        budget = Budget(
+            mode=budget_mode,
+            limit=budget_limit,
+            conclude_after=args.conclude_after,
+        )
 
-    # Save config on fresh start
-    if not resuming:
+    # Save a new allocation's budget, while preserving the existing research files.
+    if not resuming or args.continue_research:
         work_dir.mkdir(parents=True, exist_ok=True)
         _save_run_config(
             work_dir,
@@ -565,7 +617,8 @@ def _cmd_prove():
             openai_base_url=args.openai_base_url,
         )
 
-    prover = Prover(
+    prover_class = ResearchProver if mode == "research" else Prover
+    prover = prover_class(
         work_dir=work_dir,
         theorem_text=theorem_text,
         mode=mode,
@@ -646,8 +699,13 @@ def _cmd_prove():
         if has_lean:
             print(f"  PROOF.lean → {prover.work_dir / 'PROOF.lean'}")
         print(f"  {prover.work_dir}")
+        if mode == "research" and prover.is_finished:
+            print(f"  DISCUSSION.md → {prover.work_dir / 'DISCUSSION.md'}")
         if args.headless:
-            if has_proof:
+            if mode == "research":
+                status = "research_budget_exhausted" if prover.is_finished else "research_paused"
+                print(f"[result] {status}")
+            elif has_proof:
                 print("[result] proved")
             elif prover._spending_limit_hit:
                 print("[result] rate_limited")
