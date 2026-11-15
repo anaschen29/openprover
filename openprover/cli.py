@@ -38,7 +38,8 @@ def _save_run_config(work_dir: Path, *, planner_model: str, worker_model: str,
                      verifier: bool,
                      reasoning_mode: str = 'pro', reasoning_effort: str = 'max',
                      reasoning_summary: str = 'auto',
-                     openai_base_url: str = 'https://api.openai.com/v1'):
+                     openai_base_url: str = 'https://api.openai.com/v1',
+                     python_tools: bool = False):
     """Save run configuration so it can be restored on resume."""
     lines = [
         f'version = "{__version__}"',
@@ -62,6 +63,7 @@ def _save_run_config(work_dir: Path, *, planner_model: str, worker_model: str,
         f'reasoning_effort = "{reasoning_effort}"',
         f'reasoning_summary = "{reasoning_summary}"',
         f'openai_base_url = "{openai_base_url}"',
+        f'python_tools = {str(python_tools).lower()}',
     ]
     (work_dir / RUN_CONFIG_FILE).write_text("\n".join(lines) + "\n")
 
@@ -265,6 +267,8 @@ def _cmd_prove():
     parser.add_argument("--model", default="gpt-6-astra", help="Model for planner and worker (default: gpt-6-astra)")
     parser.add_argument("--planner-model", default=None, help="Override model for planner (defaults to --model)")
     parser.add_argument("--worker-model", default=None, help="Override model for worker (defaults to --model)")
+    parser.add_argument("--python", dest="python_tools", action=argparse.BooleanOptionalAction,
+                        default=False, help="Hosted Python for OpenAI research workers/reviewers (opt-in)")
     parser.add_argument("--openai-base-url", default="https://api.openai.com/v1", help="Responses API base URL")
     parser.add_argument("--reasoning-mode", choices=["standard", "pro"], default="pro", help="OpenAI reasoning mode (default: pro)")
     parser.add_argument("--reasoning-effort", choices=["low", "medium", "high", "xhigh", "max", "model-default"], default="max", help="OpenAI reasoning effort (default: max)")
@@ -405,6 +409,8 @@ def _cmd_prove():
                 args.reasoning_effort = saved.get("reasoning_effort", args.reasoning_effort)
             if not _cli_flag_given("--reasoning-summary"):
                 args.reasoning_summary = saved.get("reasoning_summary", args.reasoning_summary)
+            if not _cli_flag_given("--python", "--no-python"):
+                args.python_tools = saved.get("python_tools", args.python_tools)
             if not _cli_flag_given("--openai-base-url"):
                 args.openai_base_url = saved.get("openai_base_url", args.openai_base_url)
             if not _cli_flag_given("--conclude-after"):
@@ -454,6 +460,8 @@ def _cmd_prove():
     # Resolve effective planner/worker models
     planner_model = args.planner_model or args.model
     worker_model = args.worker_model or args.model
+    if args.python_tools and (mode != "research" or not worker_model.startswith("gpt-")):
+        parser.error("--python requires --mode research and an OpenAI worker model")
 
     # Validate and resolve --effort
     effort_given = _cli_flag_given("--effort")
@@ -482,12 +490,15 @@ def _cmd_prove():
                 f"got: {', '.join(non_claude)}"
             )
 
-    # Non-Claude models have no web search capability - force isolation
-    if planner_model.startswith("gpt-") and not args.isolation:
-        args.isolation = True  # Search integration belongs to a later PR.
-    non_claude_models = {"leanstral"} | GLM_MODELS | OPENROUTER_MODELS
-    if planner_model in non_claude_models and not args.isolation:
-        args.isolation = True
+    # Search runs on the WORKER backend, even when the planner uses another provider.
+    if mode == "research":
+        if not args.isolation and not (worker_model.startswith("gpt-") or worker_model in CLAUDE_MODELS):
+            parser.error("Literature search requires an OpenAI or Claude worker; use --isolation to disable")
+    else:
+        # Preserve legacy theorem-mode behavior.
+        non_search_models = {"leanstral"} | GLM_MODELS | OPENROUTER_MODELS
+        if planner_model.startswith("gpt-") or planner_model in non_search_models:
+            args.isolation = True
 
     if args.headless:
         args.autonomous = True
@@ -517,7 +528,7 @@ def _cmd_prove():
             if not fetch_lean_data():
                 print("Warning: lean_search will not be available")
 
-    def _make_client(model_alias, archive_dir):
+    def _make_client(model_alias, archive_dir, *, python_tools=False):
         if model_alias.startswith("gpt-"):
             key = os.environ.get("OPENAI_API_KEY")
             if not key:
@@ -527,7 +538,8 @@ def _cmd_prove():
                                 reasoning_mode=args.reasoning_mode,
                                 reasoning_effort=args.reasoning_effort,
                                 reasoning_summary=args.reasoning_summary,
-                                answer_reserve=args.answer_reserve)
+                                answer_reserve=args.answer_reserve,
+                                python_tools=python_tools)
         if model_alias in MISTRAL_MODEL_MAP:
             return MistralClient(MISTRAL_MODEL_MAP[model_alias], archive_dir,
                                  answer_reserve=args.answer_reserve)
@@ -556,7 +568,7 @@ def _cmd_prove():
         return _make_client(planner_model, archive_dir)
 
     def make_worker_llm(archive_dir):
-        return _make_client(worker_model, archive_dir)
+        return _make_client(worker_model, archive_dir, python_tools=args.python_tools)
 
     MODEL_DISPLAY = {"sonnet": "sonnet 4.6", "opus": "opus 4.6", "leanstral": "leanstral", "glm-5": "glm-5", "kimi-k2.5": "kimi-k2.5", "minimax-m2.7": "minimax-m2.7"}
     _p = MODEL_DISPLAY.get(planner_model, planner_model)
@@ -618,6 +630,7 @@ def _cmd_prove():
             reasoning_effort=args.reasoning_effort,
             reasoning_summary=args.reasoning_summary,
             openai_base_url=args.openai_base_url,
+            python_tools=args.python_tools,
         )
 
     prover_class = ResearchProver if mode == "research" else Prover

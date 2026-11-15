@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from ._base import Interrupted, archive
+from .hosted_tools import configure_tools, archive_tools
 
 class OpenAIClient:
     """Existing OpenProver client contract, using the Responses API."""
@@ -15,7 +16,7 @@ class OpenAIClient:
     def __init__(self, model="gpt-6-astra", archive_dir=None, api_key=None,
                  base_url="https://api.openai.com/v1", reasoning_mode="pro",
                  reasoning_effort="max", reasoning_summary="auto",
-                 answer_reserve=4096):
+                 answer_reserve=4096, python_tools=False):
         self.model, self.archive_dir = model, Path(archive_dir or ".")
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
@@ -24,6 +25,7 @@ class OpenAIClient:
         self.reasoning_mode, self.reasoning_effort = reasoning_mode, reasoning_effort
         self.reasoning_summary = reasoning_summary
         self.answer_reserve, self.context_length = answer_reserve, 1_050_000
+        self.python_tools = python_tools
         self.max_output_tokens = 32768
         self.total_cost, self.call_count = 0.0, 0
         self._interrupt, self._lock = threading.Event(), threading.Lock()
@@ -58,7 +60,7 @@ class OpenAIClient:
                 items.append({"role": role, "content": m.get("content") or ""})
         return items
 
-    def _payload(self, messages, tools=None, max_tokens=None, schema=None):
+    def _payload(self, messages, tools=None, max_tokens=None, schema=None, *, web_search=False):
         reasoning = {"mode": self.reasoning_mode}
         if self.reasoning_effort != "model-default":
             reasoning["effort"] = self.reasoning_effort
@@ -75,6 +77,8 @@ class OpenAIClient:
                  "parameters": t["function"]["parameters"], "strict": False}
                 for t in tools
             ]
+        configure_tools(payload, python=self.python_tools and not web_search,
+                        web_search=web_search)
         if schema:
             payload["text"] = {"format": {"type": "json_schema",
                 "name": "openprover_result", "schema": schema, "strict": True}}
@@ -143,7 +147,11 @@ class OpenAIClient:
                 return completed
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:2000]
-            raise RuntimeError("OpenAI HTTP %d: %s" % (e.code, detail)) from e
+            requested = ", ".join(t["type"] for t in payload.get("tools", [])) or "none"
+            raise RuntimeError(f"OpenAI HTTP {e.code} (model={self.model}, tools={requested}): "
+                               f"{detail}; no model/tool fallback was attempted") from e
+        except (urllib.error.URLError, TimeoutError) as e:
+            raise RuntimeError(f"OpenAI request failed: {e}") from e
 
     def _execute(self, payload, label, prompt, system_prompt, schema,
                  callback, archive_path):
@@ -151,10 +159,13 @@ class OpenAIClient:
             self.call_count += 1
             number = self.call_count
         start = time.monotonic()
+        raw = None
         try:
             raw = self._request(payload, callback)
             if self._interrupt.is_set():
                 raise Interrupted()
+            if raw.get("status") in ("failed", "cancelled"):
+                raise RuntimeError(f"OpenAI response {raw['status']}: {raw.get('error')}")
             result = self._decode(raw)
             result["duration_ms"] = int((time.monotonic() - start) * 1000)
             with self._lock:
@@ -164,22 +175,30 @@ class OpenAIClient:
                     system_prompt, schema, raw, None, result["duration_ms"],
                     archive_path, thinking=result["thinking"],
                     result_text=result["result"])
+            call_path = archive_path or self.archive_dir / f"call_{number:03d}.md"
+            evidence = archive_tools(raw, payload, call_path, base_url=self.base_url,
+                                     api_key=self.api_key)
+            if evidence:
+                # Append execution records for the next planner/reviewer, not just prose.
+                # Do not turn missing model output into a successful answer.
+                if result["result"]:
+                    result["result"] = evidence + "\n\n# Agent result\n\n" + result["result"]
+                else:
+                    result["thinking"] = ""  # Never promote a reasoning summary to a result.
             return result
         except Exception as e:
             archive(self.model, self.archive_dir, number, label, prompt,
-                    system_prompt, schema, None, str(e),
+                    system_prompt, schema, raw, str(e),
                     int((time.monotonic() - start) * 1000), archive_path)
             raise
 
     def call(self, prompt, system_prompt, json_schema=None, label="",
              web_search=False, stream_callback=None, archive_path=None,
              max_tokens=None, **kwargs):
-        if web_search:
-            raise NotImplementedError("OpenAI web search will be added in the research tools PR")
         messages = [{"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}]
         return self._execute(self._payload(messages, max_tokens=max_tokens,
-                             schema=json_schema), label, prompt, system_prompt,
+                             schema=json_schema, web_search=web_search), label, prompt, system_prompt,
                              json_schema, stream_callback, archive_path)
 
     def chat(self, messages, tools=None, max_tokens=None, label="",
